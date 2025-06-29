@@ -3,11 +3,41 @@ import passport from 'passport';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../lib/prisma';
+import { authenticateToken } from '../middleware/authenticateJWT';
 
 const router = Router();
 
+// Helper function to create session
+const createSession = async (userId: string, token: string) => {
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + 7); // 7 days from now
+  
+  await prisma.session.create({
+    data: {
+      userId,
+      token,
+      expiresAt
+    }
+  });
+};
+
+// Function to clean up expired sessions
+const cleanupExpiredSessions = async () => {
+  try {
+    await prisma.session.deleteMany({
+      where: {
+        expiresAt: {
+          lt: new Date()
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Session cleanup error:', error);
+  }
+};
+
 // Debug endpoint to check environment variables
-router.get('/debug', (req: Request, res: Response) => {
+router.get('/debug', (_: Request, res: Response) => {
   res.json({
     port: process.env['PORT'],
     clientId: process.env['GOOGLE_CLIENT_ID'] ? 'Set' : 'Not Set',
@@ -26,20 +56,23 @@ router.get('/google',
 
 router.get('/google/callback',
   passport.authenticate('google', { failureRedirect: '/login' }),
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     // Successful authentication
     const user = req.user as any;
     
     // Generate JWT token
     const token = jwt.sign(
       { 
-        id: user.id, 
+        userId: user.id,
         email: user.email, 
         name: user.name 
       },
       process.env['JWT_SECRET'] || 'your-jwt-secret',
       { expiresIn: '7d' }
     );
+
+    // Store session in database
+    await createSession(user.id, token);
 
     // Redirect to frontend with token
     const frontendURL = process.env['FRONTEND_URL'] || 'http://localhost:3000';
@@ -64,6 +97,7 @@ router.post('/login', async (req: Request, res: Response) => {
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
+      
     }
 
     // Find user by email
@@ -85,20 +119,19 @@ router.post('/login', async (req: Request, res: Response) => {
     await prisma.user.update({
       where: { id: user.id },
       data: { lastLogin: new Date() }
-    });
-
-    // Generate JWT token
+    });    // Generate JWT token
     const token = jwt.sign(
       { 
-        id: user.id, 
+        userId: user.id,
         email: user.email, 
         name: user.name 
       },
       process.env['JWT_SECRET'] || 'your-jwt-secret',
       { expiresIn: '7d' }
-    );
+    );    // Store session in database
+    await createSession(user.id, token);
 
-    res.json({
+    return res.json({
       success: true,
       token,
       user: {
@@ -111,7 +144,7 @@ router.post('/login', async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -144,12 +177,10 @@ router.post('/register', async (req: Request, res: Response) => {
         name: name || '',
         isVerified: false, // Email verification required
       }
-    });
-
-    // Generate JWT token
+    });    // Generate JWT token
     const token = jwt.sign(
       { 
-        id: user.id, 
+        userId: user.id,
         email: user.email, 
         name: user.name 
       },
@@ -157,7 +188,10 @@ router.post('/register', async (req: Request, res: Response) => {
       { expiresIn: '7d' }
     );
 
-    res.status(201).json({
+    // Store session in database
+    await createSession(user.id, token);
+
+    return res.status(201).json({
       success: true,
       token,
       user: {
@@ -170,39 +204,59 @@ router.post('/register', async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Logout endpoint
-router.post('/logout', (req: Request, res: Response) => {
-  req.logout((err: Error) => {
-    if (err) {
-      return res.status(500).json({ error: 'Logout failed' });
+router.post('/logout', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+      return res.status(400).json({ error: 'No token provided' });
     }
-    res.json({ message: 'Logged out successfully' });
-    return;
-  });
+
+    // Remove session from database
+    await prisma.session.deleteMany({
+      where: { token }
+    });
+
+    return res.json({ 
+      success: true,
+      message: 'Logged out successfully' 
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Middleware to authenticate JWT token
-function authenticateToken(req: Request, res: Response, next: any) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+// Optional: Logout from all devices
+router.post('/logout-all', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req.user as any).userId;
 
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
+    // Remove all sessions for this user
+    await prisma.session.deleteMany({
+      where: { userId }
+    });
+
+    return res.json({ 
+      success: true,
+      message: 'Logged out from all devices successfully' 
+    });
+  } catch (error) {
+    console.error('Logout all error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
+});
 
-  jwt.verify(token, process.env['JWT_SECRET'] || 'your-jwt-secret', (err: any, user: any) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    req.user = user;
-    next();
-    return;
-  });
-  return;
-}
+// Clean up expired sessions periodically
+setInterval(cleanupExpiredSessions, 60 * 60 * 1000); // Clean up every hour
+
+
+
 
 export default router;

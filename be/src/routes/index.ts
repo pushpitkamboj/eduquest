@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import authRoutes from './auth';
+import userRoutes from './users';
 // import userRoutes from './users';
 
 const router = Router();
 
 // Mount route modules
 router.use('/auth', authRoutes);
-// router.use('/users', userRoutes);
+router.use('/user', userRoutes);
 
 // API info endpoint
 router.get('/', (_req, res) => {
